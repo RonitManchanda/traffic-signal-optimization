@@ -8,24 +8,32 @@ from ultralytics import YOLO
 # CONFIG
 # =========================
 VIDEO_PATH = "intersection.mp4"
-MODEL_PATH = "yolov8m.pt"
-TRACKER_CFG = "botsort.yaml"
+MODEL_PATH = "yolo11s.pt"
+TRACKER_CFG = "botsort_custom.yaml"
 
 TARGET_CLASSES = {2, 3, 5, 7}  # car, motorcycle, bus, truck
+BLOCKER_CLASSES = {2, 5, 7}       # bus, truck
 
-CONF_THRESHOLD = 0.20
-IOU_THRESHOLD = 0.50
+CONF_THRESHOLD = 0.15
+IOU_THRESHOLD = 0.45
 
 MIN_BOX_AREA = 900
-HISTORY_LEN = 12
+HISTORY_LEN = 14
 MIN_TRACK_AGE = 5
 MIN_HISTORY_FOR_DECISION = 6
 MIN_DIRECTION_SCORE = 0.55
+STRAIGHT_DIRECTION_SCORE = 0.88
 MAX_MISSING_FRAMES = 40
 
-# turn-specific thresholds
-TURN_APPROACH_THRESHOLD = 0.20
-TURN_EXIT_THRESHOLD = 0.35
+# Turn logic
+TURN_LANE_CONFIRM_FRAMES = 3
+TURN_EXIT_DIRECTION_HITS = 2
+TURN_EXIT_SCORE_THRESHOLD = 0.30
+
+# Fallback / blocker logic
+BLOCKER_MIN_BOX_AREA = 18000
+STRAIGHT_BACKUP_SCORE_THRESHOLD = 0.50
+STRAIGHT_BACKUP_LABELS = {"N", "NW", "NE"}
 
 # =========================
 # LANE POLYGON COORDINATES
@@ -39,10 +47,10 @@ LANE_POLYGONS = {
     ], dtype=np.int32),
 
     "south_to_north_straight": np.array([
-        (1414, 836),
-        (1264, 855),
-        (1550, 1061),
-        (1778, 1062)
+        (1432, 990),
+        (1270, 862),
+        (1551, 923),
+        (1432, 990)
     ], dtype=np.int32),
 
     "south_to_east_turn": np.array([
@@ -51,22 +59,29 @@ LANE_POLYGONS = {
         (1883, 966),
         (1786, 1059),
     ], dtype=np.int32),
+    "east_to_south_turn": np.array([
+        (1481, 651),
+        (1420, 620),
+        (1642, 604),
+        (1652, 635),
+    ], dtype=np.int32),
 }
 
 LANE_COLORS = {
     "south_to_west_turn": (0, 165, 255),      # orange
     "south_to_north_straight": (255, 255, 0), # yellow
-    "south_to_east_turn": (0, 255, 255),      # cyan/yellow-ish
+    "south_to_east_turn": (0, 255, 255),
+    "east_to_south_turn": (50, 200, 110),# cyan
 }
 
 # =========================
-# X-Y Axis Coordinates
+# X-Y AXIS COORDINATES
 # =========================
 Y_LINE = ((819, 550), (1258, 857))
 X_LINE = ((180, 735), (1439, 621))
 
 # =========================
-# Helper Methods
+# HELPER METHODS
 # =========================
 def normalize_vector(dx, dy):
     mag = math.sqrt(dx * dx + dy * dy)
@@ -110,56 +125,15 @@ def draw_polygons(frame):
 
 def draw_axis_lines(frame):
     cv2.line(frame, Y_LINE[0], Y_LINE[1], (0, 255, 0), 2)
-    cv2.putText(
-        frame,
-        "Y_LINE",
-        Y_LINE[0],
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 0),
-        2
-    )
+    cv2.putText(frame, "Y_LINE", Y_LINE[0], cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     cv2.line(frame, X_LINE[0], X_LINE[1], (255, 0, 255), 2)
-    cv2.putText(
-        frame,
-        "X_LINE",
-        X_LINE[0],
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 0, 255),
-        2
-    )
+    cv2.putText(frame, "X_LINE", X_LINE[0], cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
 
 def motion_score(dx, dy, expected_vec):
     move_vec = normalize_vector(dx, dy)
     return dot(move_vec, expected_vec)
-
-
-def segmented_turn_scores(history, approach_vec, exit_vec):
-    if len(history) < 6:
-        return None, None, None, None
-
-    pts = list(history)
-    mid = len(pts) // 2
-
-    first_half = pts[:mid]
-    second_half = pts[mid:]
-
-    if len(first_half) < 2 or len(second_half) < 2:
-        return None, None, None, None
-
-    dx1 = first_half[-1][0] - first_half[0][0]
-    dy1 = first_half[-1][1] - first_half[0][1]
-
-    dx2 = second_half[-1][0] - second_half[0][0]
-    dy2 = second_half[-1][1] - second_half[0][1]
-
-    approach_score = motion_score(dx1, dy1, approach_vec)
-    exit_score = motion_score(dx2, dy2, exit_vec)
-
-    return approach_score, exit_score, first_half, second_half
 
 
 def draw_motion_arrow(frame, start_pt, end_pt, color):
@@ -189,28 +163,33 @@ def direction_label(dx, dy):
 
 
 def direction_label_from_points(p1, p2):
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    return direction_label(dx, dy)
+    return direction_label(p2[0] - p1[0], p2[1] - p1[1])
 
 
-def segmented_turn_direction_labels(history):
-    if len(history) < 6:
-        return None, None
-
+def recent_direction_label(history, recent_len=4):
     pts = list(history)
-    mid = len(pts) // 2
+    if len(pts) < 2:
+        return None
 
-    first_half = pts[:mid]
-    second_half = pts[mid:]
+    pts = pts[-recent_len:] if len(pts) >= recent_len else pts
+    if len(pts) < 2:
+        return None
 
-    if len(first_half) < 2 or len(second_half) < 2:
-        return None, None
+    return direction_label_from_points(pts[0], pts[-1])
 
-    approach_label = direction_label_from_points(first_half[0], first_half[-1])
-    exit_label = direction_label_from_points(second_half[0], second_half[-1])
 
-    return approach_label, exit_label
+def recent_motion_score(history, expected_vec, recent_len=4):
+    pts = list(history)
+    if len(pts) < 2:
+        return None
+
+    pts = pts[-recent_len:] if len(pts) >= recent_len else pts
+    if len(pts) < 2:
+        return None
+
+    dx = pts[-1][0] - pts[0][0]
+    dy = pts[-1][1] - pts[0][1]
+    return motion_score(dx, dy, expected_vec)
 
 
 def detect_lane(point):
@@ -220,7 +199,17 @@ def detect_lane(point):
     return None
 
 
-def cleanup_old_tracks(frame_index, track_history, track_age, lane_votes, committed_lane, last_seen, counted_track_ids):
+def cleanup_old_tracks(
+    frame_index,
+    track_history,
+    track_age,
+    lane_votes,
+    committed_lane,
+    last_seen,
+    counted_track_ids,
+    turn_lane_seen_frames,
+    turn_exit_hits,
+):
     stale_ids = [
         track_id for track_id, seen_frame in last_seen.items()
         if frame_index - seen_frame > MAX_MISSING_FRAMES
@@ -232,39 +221,37 @@ def cleanup_old_tracks(frame_index, track_history, track_age, lane_votes, commit
         lane_votes.pop(track_id, None)
         committed_lane.pop(track_id, None)
         last_seen.pop(track_id, None)
-        # counted_track_ids intentionally kept so old IDs do not get counted again
+        turn_lane_seen_frames.pop(track_id, None)
+        turn_exit_hits.pop(track_id, None)
+        # counted_track_ids intentionally kept
 
 
 # =========================
-# Axis Vector Calibration
+# AXIS VECTOR CALIBRATION
 # =========================
 Y_AXIS = vector_from_points(*Y_LINE)
 X_AXIS = vector_from_points(*X_LINE)
 
-# Straight-lane expected motion.
 EXPECTED_MOTION = {
     "south_to_north_straight": (-Y_AXIS[0], -Y_AXIS[1]),
-    "south_to_east_turn": (X_AXIS[0], X_AXIS[1]),
 }
 
-# Turn lane uses phase-based checking:
-# 1. approach along Y-ish direction
-# 2. exit along westbound X-ish direction
+# Both turn lanes are true turn lanes now
 TURN_EXPECTED_MOTION = {
     "south_to_west_turn": {
-        "approach": (-Y_AXIS[0], -Y_AXIS[1]),
-        "exit": (-X_AXIS[0], -X_AXIS[1])
-    }
+        "exit_vec": (-X_AXIS[0], -X_AXIS[1]),
+        # tune these to what you actually see on screen
+        "exit_labels": {"W"},
+    },
+    "south_to_east_turn": {
+        "exit_vec": (X_AXIS[0], X_AXIS[1]),
+        "exit_labels": {"E", "NE"},
+    },
+    "east_to_south_turn": {
+        "exit_vec": (X_AXIS[0], -X_AXIS[1]),
+        "exit_labels": {"S", "SE", "SW"},
+    },
 }
-
-# Compass-label transition check for turn lanes.
-TURN_DIRECTION_LABELS = {
-    "south_to_west_turn": {
-        "approach": {"NW", "W"},
-        "exit": {"W"}
-    }
-}
-
 
 # =========================
 # MAIN
@@ -282,6 +269,7 @@ def main():
         "south_to_west_turn": 0,
         "south_to_north_straight": 0,
         "south_to_east_turn": 0,
+        "east_to_south_turn": 0,
     }
 
     event_log = []
@@ -292,6 +280,10 @@ def main():
     lane_votes = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
     committed_lane = {}
     last_seen = {}
+
+    # new state
+    turn_lane_seen_frames = defaultdict(int)
+    turn_exit_hits = defaultdict(int)
 
     cv2.namedWindow("Lane Test", cv2.WINDOW_NORMAL)
     frame_index = 0
@@ -317,7 +309,38 @@ def main():
 
         result = results[0]
 
+        # per-frame blocker flags
+        blocker_active = {
+            "south_to_west_turn": False,
+            "south_to_east_turn": False,
+        }
+
         if result.boxes is not None:
+            # pass 1: detect blockers
+            for box in result.boxes:
+                if box.id is None:
+                    continue
+
+                cls_id = int(box.cls[0].item())
+                if cls_id not in TARGET_CLASSES:
+                    continue
+
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                box_area = (x2 - x1) * (y2 - y1)
+                if box_area < MIN_BOX_AREA:
+                    continue
+
+                road_point = get_bottom_center(x1, y1, x2, y2)
+                lane_now = detect_lane(road_point)
+
+                if (
+                    cls_id in BLOCKER_CLASSES
+                    and box_area >= BLOCKER_MIN_BOX_AREA
+                    and lane_now in blocker_active
+                ):
+                    blocker_active[lane_now] = True
+
+            # pass 2: normal processing
             for box in result.boxes:
                 if box.id is None:
                     continue
@@ -339,7 +362,6 @@ def main():
                 track_age[track_id] += 1
                 track_history[track_id].append(road_point)
 
-                # draw detection
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
                 cv2.circle(frame, road_point, 4, (0, 0, 255), -1)
 
@@ -355,17 +377,17 @@ def main():
                             committed_lane[track_id] = lane_name
                             break
 
-                # build label safely
-                label = f"ID {track_id}"
+                history = track_history[track_id]
 
+                # label
+                label = f"ID {track_id}"
                 if track_id in committed_lane:
                     label += f" | {committed_lane[track_id]}"
 
-                history = track_history[track_id]
                 if len(history) >= 2:
-                    dx_label = history[-1][0] - history[0][0]
-                    dy_label = history[-1][1] - history[0][1]
-                    dir_label = direction_label(dx_label, dy_label)
+                    dir_label = recent_direction_label(history, recent_len=4)
+                    if dir_label is None:
+                        dir_label = "..."
                     label += f" | {dir_label}"
                 else:
                     label += " | ..."
@@ -380,55 +402,56 @@ def main():
                     2
                 )
 
+                if len(history) >= 2:
+                    draw_motion_arrow(frame, history[0], history[-1], (120, 255, 120))
+
                 if track_id in counted_track_ids:
                     continue
 
                 if track_age[track_id] < MIN_TRACK_AGE:
                     continue
 
-                if track_id not in committed_lane:
-                    continue
-
-                history = track_history[track_id]
                 if len(history) < MIN_HISTORY_FOR_DECISION:
                     continue
 
                 dx = history[-1][0] - history[0][0]
                 dy = history[-1][1] - history[0][1]
-                dir_label = direction_label(dx, dy)
+                full_dir_label = direction_label(dx, dy)
                 nx, ny = normalize_vector(dx, dy)
 
-                lane_name = committed_lane[track_id]
+                recent_dir = recent_direction_label(history, recent_len=4)
+                lane_name = committed_lane.get(track_id)
+                straight_score = motion_score(dx, dy, EXPECTED_MOTION["south_to_north_straight"])
 
-                if lane_name == "south_to_west_turn":
-                    approach_vec = TURN_EXPECTED_MOTION[lane_name]["approach"]
-                    exit_vec = TURN_EXPECTED_MOTION[lane_name]["exit"]
+                # =========================
+                # TURN LANES
+                # =========================
+                if lane_name in TURN_EXPECTED_MOTION:
+                    turn_lane_seen_frames[track_id] += 1
 
-                    approach_score, exit_score, first_half, second_half = segmented_turn_scores(
-                        history,
-                        approach_vec,
-                        exit_vec
+                    exit_vec = TURN_EXPECTED_MOTION[lane_name]["exit_vec"]
+                    exit_labels = TURN_EXPECTED_MOTION[lane_name]["exit_labels"]
+
+                    current_exit_score = recent_motion_score(history, exit_vec, recent_len=4)
+                    if current_exit_score is None:
+                        continue
+
+                    in_exit_direction = (
+                        recent_dir in exit_labels
+                        and current_exit_score >= TURN_EXIT_SCORE_THRESHOLD
                     )
 
-                    if approach_score is None or exit_score is None:
-                        continue
+                    if in_exit_direction:
+                        turn_exit_hits[track_id] += 1
+                    else:
+                        turn_exit_hits[track_id] = 0
 
-                    approach_ok = approach_score >= TURN_APPROACH_THRESHOLD
-                    exit_ok = exit_score >= TURN_EXIT_THRESHOLD
-
-                    approach_label, exit_label = segmented_turn_direction_labels(history)
-                    if approach_label is None or exit_label is None:
-                        continue
-
-                    allowed_approach = TURN_DIRECTION_LABELS[lane_name]["approach"]
-                    allowed_exit = TURN_DIRECTION_LABELS[lane_name]["exit"]
-
-                    approach_label_ok = approach_label in allowed_approach
-                    exit_label_ok = exit_label in allowed_exit
+                    lane_ready = turn_lane_seen_frames[track_id] >= TURN_LANE_CONFIRM_FRAMES
+                    exit_ready = turn_exit_hits[track_id] >= TURN_EXIT_DIRECTION_HITS
 
                     cv2.putText(
                         frame,
-                        f"approach={approach_score:.2f}",
+                        f"turn_seen={turn_lane_seen_frames[track_id]}",
                         (x1, y2 + 18),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -438,7 +461,7 @@ def main():
 
                     cv2.putText(
                         frame,
-                        f"exit={exit_score:.2f}",
+                        f"recent={recent_dir} exit_score={current_exit_score:.2f}",
                         (x1, y2 + 36),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -448,40 +471,26 @@ def main():
 
                     cv2.putText(
                         frame,
-                        f"A:{approach_ok} E:{exit_ok}",
+                        f"lane_ready={lane_ready} exit_hits={turn_exit_hits[track_id]}",
                         (x1, y2 + 54),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
-                        (0, 255, 0) if (approach_ok and exit_ok) else (0, 0, 255),
-                        1
-                    )
-
-                    cv2.putText(
-                        frame,
-                        f"{approach_label}->{exit_label}",
-                        (x1, y2 + 72),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 255, 0) if (approach_label_ok and exit_label_ok) else (0, 0, 255),
+                        (0, 255, 0) if exit_ready else (0, 0, 255),
                         1
                     )
 
                     cv2.putText(
                         frame,
                         f"vec=({nx:.2f},{ny:.2f})",
-                        (x1, y2 + 90),
+                        (x1, y2 + 72),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
                         (200, 200, 200),
                         1
                     )
 
-                    if first_half is not None and len(first_half) >= 2:
-                        draw_motion_arrow(frame, first_half[0], first_half[-1], (0, 255, 255))
-                    if second_half is not None and len(second_half) >= 2:
-                        draw_motion_arrow(frame, second_half[0], second_half[-1], (255, 0, 0))
-
-                    if approach_ok and exit_ok and approach_label_ok and exit_label_ok:
+                    # only count once the vehicle actually changes into exit direction
+                    if lane_ready and exit_ready:
                         counts[lane_name] += 1
                         counted_track_ids.add(track_id)
 
@@ -491,17 +500,15 @@ def main():
                             "track_id": track_id,
                             "lane": lane_name,
                             "type": "TURN",
-                            "direction": f"{approach_label}->{exit_label}",
-                            "approach_score": round(approach_score, 2),
-                            "exit_score": round(exit_score, 2),
+                            "direction": recent_dir,
+                            "exit_score": round(current_exit_score, 2),
                             "vec": (round(nx, 2), round(ny, 2)),
                         }
                         event_log.append(event)
 
                         print(
-                            f"[{timestamp_str}]  | ID {track_id} | "
-                            f"{lane_name} | {approach_label}->{exit_label} | "
-                            f"approach={approach_score:.2f} exit={exit_score:.2f}"
+                            f"[{timestamp_str}] TURN | ID {track_id} | "
+                            f"{lane_name} | dir={recent_dir} | exit_score={current_exit_score:.2f}"
                         )
 
                         cv2.putText(
@@ -514,60 +521,80 @@ def main():
                             2
                         )
 
-                else:
-                    expected_vec = EXPECTED_MOTION[lane_name]
-                    score = motion_score(dx, dy, expected_vec)
+                    continue
 
-                    cv2.putText(
-                        frame,
-                        f"score={score:.2f}",
-                        (x1, y2 + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (255, 255, 255),
-                        1
+                # =========================
+                # STRAIGHT LANE / BACKUP
+                # =========================
+                cv2.putText(
+                    frame,
+                    f"straight_score={straight_score:.2f}",
+                    (x1, y2 + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1
+                )
+
+                cv2.putText(
+                    frame,
+                    f"vec=({nx:.2f},{ny:.2f})",
+                    (x1, y2 + 36),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (200, 200, 200),
+                    1
+                )
+
+                # normal straight count
+                normal_straight_ok = (
+                    lane_name == "south_to_north_straight"
+                    and straight_score >= STRAIGHT_DIRECTION_SCORE
+                )
+
+                # blocker fallback:
+                # if a big truck/bus is in either turn lane and this visible track is moving straight,
+                # let it count as straight even if lane commitment is missing/noisy.
+                fallback_straight_ok = (
+                    (
+                        blocker_active["south_to_west_turn"]
+                        or blocker_active["south_to_east_turn"]
+                    )
+                    and lane_now == "south_to_north_straight"
+                    and recent_dir in STRAIGHT_BACKUP_LABELS
+                    and straight_score >= STRAIGHT_BACKUP_SCORE_THRESHOLD
+                )
+
+                if normal_straight_ok or fallback_straight_ok:
+                    counts["south_to_north_straight"] += 1
+                    counted_track_ids.add(track_id)
+
+                    timestamp_str = f"{timestamp_seconds:.2f}s"
+                    event = {
+                        "time": timestamp_str,
+                        "track_id": track_id,
+                        "lane": "south_to_north_straight",
+                        "type": "STRAIGHT_BACKUP" if fallback_straight_ok and not normal_straight_ok else "STRAIGHT",
+                        "direction": full_dir_label,
+                        "score": round(straight_score, 2),
+                        "vec": (round(nx, 2), round(ny, 2)),
+                    }
+                    event_log.append(event)
+
+                    print(
+                        f"[{timestamp_str}] {event['type']} | ID {track_id} | "
+                        f"south_to_north_straight | {full_dir_label} | score={straight_score:.2f}"
                     )
 
                     cv2.putText(
                         frame,
-                        f"vec=({nx:.2f},{ny:.2f})",
-                        (x1, y2 + 36),
+                        f"COUNTED {event['type']}",
+                        (road_point[0] + 10, road_point[1]),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (200, 200, 200),
-                        1
+                        0.6,
+                        LANE_COLORS["south_to_north_straight"],
+                        2
                     )
-
-                    if score >= MIN_DIRECTION_SCORE:
-                        counts[lane_name] += 1
-                        counted_track_ids.add(track_id)
-
-                        timestamp_str = f"{timestamp_seconds:.2f}s"
-                        event = {
-                            "time": timestamp_str,
-                            "track_id": track_id,
-                            "lane": lane_name,
-                            "type": "STRAIGHT",
-                            "direction": dir_label,
-                            "score": round(score, 2),
-                            "vec": (round(nx, 2), round(ny, 2)),
-                        }
-                        event_log.append(event)
-
-                        print(
-                            f"[{timestamp_str}] STRAIGHT | ID {track_id} | "
-                            f"{lane_name} | {dir_label} | score={score:.2f}"
-                        )
-
-                        cv2.putText(
-                            frame,
-                            f"COUNTED {lane_name}",
-                            (road_point[0] + 10, road_point[1]),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            LANE_COLORS[lane_name],
-                            2
-                        )
 
         cleanup_old_tracks(
             frame_index,
@@ -576,10 +603,11 @@ def main():
             lane_votes,
             committed_lane,
             last_seen,
-            counted_track_ids
+            counted_track_ids,
+            turn_lane_seen_frames,
+            turn_exit_hits,
         )
 
-        # display counts
         y = 35
         for name, count in counts.items():
             cv2.putText(
@@ -592,6 +620,20 @@ def main():
                 2
             )
             y += 35
+
+        # blocker display
+        by = y + 10
+        for lane_name, active in blocker_active.items():
+            cv2.putText(
+                frame,
+                f"blocker_{lane_name}: {active}",
+                (20, by),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255) if active else (180, 180, 180),
+                2
+            )
+            by += 28
 
         cv2.imshow("Lane Test", frame)
 

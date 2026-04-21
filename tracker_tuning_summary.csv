@@ -1,0 +1,9 @@
+tracker,conf,iou,frames_processed,total_vehicle_boxes,total_unique_track_ids,short_tracks,avg_track_length,min_track_length,max_track_length,fragmented_tracks,total_internal_gaps,probable_reid_events,return_events
+botsort_custom.yaml,0.15,0.45,2155,29846,233,78,128.09,1,1923,102,499,64,64
+botsort_custom.yaml,0.15,0.5,2155,29915,234,78,127.84,1,1923,103,501,64,64
+botsort_custom.yaml,0.2,0.45,2155,29500,235,80,125.53,1,1919,104,574,66,66
+botsort_custom.yaml,0.2,0.5,2155,29575,236,80,125.32,1,1919,104,581,66,66
+bytetrack.yaml,0.15,0.5,2155,28521,371,158,76.88,1,1875,144,711,180,180
+bytetrack.yaml,0.2,0.5,2155,28521,371,158,76.88,1,1875,144,711,180,180
+bytetrack.yaml,0.15,0.45,2155,28465,372,159,76.52,1,1875,145,701,181,181
+bytetrack.yaml,0.2,0.45,2155,28465,372,159,76.52,1,1875,145,701,181,181
