@@ -13,7 +13,7 @@ TRACKER_CFG = "botsort.yaml"
 
 TARGET_CLASSES = {2, 3, 5, 7}  # car, motorcycle, bus, truck
 
-CONF_THRESHOLD = 0.10
+CONF_THRESHOLD = 0.20
 IOU_THRESHOLD = 0.50
 
 MIN_BOX_AREA = 900
@@ -28,7 +28,7 @@ TURN_APPROACH_THRESHOLD = 0.20
 TURN_EXIT_THRESHOLD = 0.35
 
 # =========================
-# USER-PROVIDED LANE POLYGONS
+# LANE POLYGON COORDINATES
 # =========================
 LANE_POLYGONS = {
     "south_to_west_turn": np.array([
@@ -60,13 +60,13 @@ LANE_COLORS = {
 }
 
 # =========================
-# USER-PROVIDED AXIS LINES
+# X-Y Axis Coordinates
 # =========================
 Y_LINE = ((819, 550), (1258, 857))
 X_LINE = ((180, 735), (1439, 621))
 
 # =========================
-# HELPERS
+# Helper Methods
 # =========================
 def normalize_vector(dx, dy):
     mag = math.sqrt(dx * dx + dy * dy)
@@ -236,13 +236,12 @@ def cleanup_old_tracks(frame_index, track_history, track_age, lane_votes, commit
 
 
 # =========================
-# AXIS CALIBRATION
+# Axis Vector Calibration
 # =========================
 Y_AXIS = vector_from_points(*Y_LINE)
 X_AXIS = vector_from_points(*X_LINE)
 
 # Straight-lane expected motion.
-# If labels look backward, flip the signs here.
 EXPECTED_MOTION = {
     "south_to_north_straight": (-Y_AXIS[0], -Y_AXIS[1]),
     "south_to_east_turn": (X_AXIS[0], X_AXIS[1]),
@@ -256,24 +255,15 @@ TURN_EXPECTED_MOTION = {
         "approach": (-Y_AXIS[0], -Y_AXIS[1]),
         "exit": (-X_AXIS[0], -X_AXIS[1])
     }
-
 }
 
 # Compass-label transition check for turn lanes.
-# Start loose, then tighten after you inspect real outputs.
 TURN_DIRECTION_LABELS = {
     "south_to_west_turn": {
         "approach": {"NW", "W"},
         "exit": {"W"}
-    },
-    "south_to_east_turn": {
-        "approach": {"NW", "W"},
-        "exit": {"E"}
     }
-
-
 }
-
 
 
 # =========================
@@ -286,11 +276,15 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {VIDEO_PATH}")
 
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
     counts = {
         "south_to_west_turn": 0,
         "south_to_north_straight": 0,
         "south_to_east_turn": 0,
     }
+
+    event_log = []
 
     counted_track_ids = set()
     track_history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
@@ -306,6 +300,8 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
+
+        timestamp_seconds = frame_index / fps if fps > 0 else 0.0
 
         draw_polygons(frame)
         draw_axis_lines(frame)
@@ -399,6 +395,7 @@ def main():
 
                 dx = history[-1][0] - history[0][0]
                 dy = history[-1][1] - history[0][1]
+                dir_label = direction_label(dx, dy)
                 nx, ny = normalize_vector(dx, dy)
 
                 lane_name = committed_lane[track_id]
@@ -488,6 +485,25 @@ def main():
                         counts[lane_name] += 1
                         counted_track_ids.add(track_id)
 
+                        timestamp_str = f"{timestamp_seconds:.2f}s"
+                        event = {
+                            "time": timestamp_str,
+                            "track_id": track_id,
+                            "lane": lane_name,
+                            "type": "TURN",
+                            "direction": f"{approach_label}->{exit_label}",
+                            "approach_score": round(approach_score, 2),
+                            "exit_score": round(exit_score, 2),
+                            "vec": (round(nx, 2), round(ny, 2)),
+                        }
+                        event_log.append(event)
+
+                        print(
+                            f"[{timestamp_str}]  | ID {track_id} | "
+                            f"{lane_name} | {approach_label}->{exit_label} | "
+                            f"approach={approach_score:.2f} exit={exit_score:.2f}"
+                        )
+
                         cv2.putText(
                             frame,
                             "COUNTED TURN",
@@ -525,6 +541,23 @@ def main():
                     if score >= MIN_DIRECTION_SCORE:
                         counts[lane_name] += 1
                         counted_track_ids.add(track_id)
+
+                        timestamp_str = f"{timestamp_seconds:.2f}s"
+                        event = {
+                            "time": timestamp_str,
+                            "track_id": track_id,
+                            "lane": lane_name,
+                            "type": "STRAIGHT",
+                            "direction": dir_label,
+                            "score": round(score, 2),
+                            "vec": (round(nx, 2), round(ny, 2)),
+                        }
+                        event_log.append(event)
+
+                        print(
+                            f"[{timestamp_str}] STRAIGHT | ID {track_id} | "
+                            f"{lane_name} | {dir_label} | score={score:.2f}"
+                        )
 
                         cv2.putText(
                             frame,
@@ -570,10 +603,16 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+
     print("\n========== FINAL COUNTS ==========")
     for lane, count in counts.items():
         print(f"{lane}: {count}")
     print("==================================")
+
+    print("\n========== EVENT LOG ==========")
+    for event in event_log:
+        print(event)
+    print("================================")
 
 
 if __name__ == "__main__":
