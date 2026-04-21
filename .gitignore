@@ -1,0 +1,22 @@
+# PyCharm
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment variables
+.env
+
+# Outputs
+outputs/
+*.mp4
+*.avi
+
+# OS
+.DS_Store
+Thumbs.db
